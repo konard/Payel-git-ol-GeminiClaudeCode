@@ -6,6 +6,7 @@ import uuid
 import time
 import re
 import sys
+from urllib.parse import urlparse
 
 GEMINI_API_URL = "http://localhost:8081/v1"
 GEMINI_API_KEY = "sk-gemini"
@@ -56,15 +57,112 @@ def extract_text(content) -> str:
     return str(content) if content else ""
 
 
+# Map Anthropic stop_reason <-> OpenAI finish_reason
+_FINISH_TO_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+
+
+def convert_tools(tools) -> list:
+    """Anthropic tool definitions -> OpenAI function tools."""
+    out = []
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        # Already in OpenAI shape (defensive passthrough).
+        if t.get("type") == "function" and "function" in t:
+            out.append(t)
+            continue
+        name = t.get("name")
+        if not name:
+            continue
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema") or {"type": "object", "properties": {}},
+            },
+        })
+    return out
+
+
+def convert_tool_choice(choice):
+    """Anthropic tool_choice -> OpenAI tool_choice."""
+    if not isinstance(choice, dict):
+        return None
+    kind = choice.get("type")
+    if kind == "auto":
+        return "auto"
+    if kind == "any":
+        return "required"
+    if kind == "none":
+        return "none"
+    if kind == "tool" and choice.get("name"):
+        return {"type": "function", "function": {"name": choice["name"]}}
+    return None
+
+
 def anthropic_messages_to_openai(body: dict) -> dict:
     msgs = []
     system = extract_text(body.get("system", ""))
 
     for m in body.get("messages", []):
-        if m["role"] == "system":
-            system += "\n" + extract_text(m["content"])
-        else:
-            msgs.append({"role": m["role"], "content": extract_text(m["content"])})
+        role = m.get("role")
+        content = m.get("content")
+
+        if role == "system":
+            system += "\n" + extract_text(content)
+            continue
+
+        # Plain string content: forward as-is.
+        if isinstance(content, str):
+            msgs.append({"role": role, "content": content})
+            continue
+
+        if not isinstance(content, list):
+            msgs.append({"role": role, "content": extract_text(content)})
+            continue
+
+        if role == "assistant":
+            text_parts = []
+            tool_calls = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype in ("text", "input_text"):
+                    text_parts.append(block.get("text", ""))
+                elif btype == "tool_use":
+                    tool_calls.append({
+                        "id": block.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name", ""),
+                            "arguments": json.dumps(block.get("input", {})),
+                        },
+                    })
+            msg = {"role": "assistant", "content": "".join(text_parts) or None}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            msgs.append(msg)
+            continue
+
+        # role == "user" (or anything else): tool_result blocks become tool
+        # messages; remaining text becomes a user message.
+        text_parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "tool_result":
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": block.get("tool_use_id", ""),
+                    "content": extract_text(block.get("content", "")) or "",
+                })
+            elif btype in ("text", "input_text"):
+                text_parts.append(block.get("text", ""))
+        if text_parts:
+            msgs.append({"role": "user", "content": "".join(text_parts)})
 
     openai_body = {
         "model": resolve_model(body.get("model", "gemini-3.5-flash")),
@@ -76,6 +174,12 @@ def anthropic_messages_to_openai(body: dict) -> dict:
         openai_body["temperature"] = body["temperature"]
     if body.get("top_p"):
         openai_body["top_p"] = body["top_p"]
+    tools = convert_tools(body.get("tools"))
+    if tools:
+        openai_body["tools"] = tools
+        tc = convert_tool_choice(body.get("tool_choice"))
+        if tc is not None:
+            openai_body["tool_choice"] = tc
     if system.strip():
         openai_body["messages"].insert(
             0, {"role": "system", "content": system.strip()}
@@ -85,21 +189,42 @@ def anthropic_messages_to_openai(body: dict) -> dict:
 
 def openai_response_to_anthropic(resp: dict) -> dict:
     choice = resp["choices"][0]
-    content_text = choice["message"]["content"]
-    stop_reason = {"stop": "end_turn", "length": "max_tokens"}.get(
-        choice.get("finish_reason", "stop"), "end_turn"
-    )
+    message = choice.get("message", {})
+    content_blocks = []
+    if message.get("content"):
+        content_blocks.append({"type": "text", "text": message["content"]})
+    for tc in message.get("tool_calls") or []:
+        fn = tc.get("function", {})
+        try:
+            tool_input = json.loads(fn.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            tool_input = {}
+        content_blocks.append({
+            "type": "tool_use",
+            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
+            "name": fn.get("name", ""),
+            "input": tool_input,
+        })
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": ""})
+
+    finish = choice.get("finish_reason", "stop")
+    if message.get("tool_calls"):
+        finish = "tool_calls"
+    stop_reason = _FINISH_TO_STOP.get(finish, "end_turn")
+
+    usage = resp.get("usage", {}) or {}
     return {
-        "id": resp["id"].replace("chatcmpl", "msg"),
+        "id": resp.get("id", f"msg_{uuid.uuid4().hex[:12]}").replace("chatcmpl", "msg"),
         "type": "message",
         "role": "assistant",
-        "content": [{"type": "text", "text": content_text}],
-        "model": resp["model"],
+        "content": content_blocks,
+        "model": resp.get("model", ""),
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": resp["usage"]["prompt_tokens"],
-            "output_tokens": resp["usage"]["completion_tokens"],
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
         },
     }
 
@@ -147,31 +272,83 @@ def proxy_stream(openai_body: dict):
     model_name = openai_body["model"]
 
     yield f"event: message_start\ndata: {json.dumps({'type': 'message_start','message': {'id': msg_id,'type': 'message','role': 'assistant','content': [],'model': model_name,'stop_reason': None,'stop_sequence': None,'usage': {'input_tokens': 0,'output_tokens': 0}}})}\n\n"
-    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start','index': 0,'content_block': {'type': 'text','text': ''}})}\n\n"
 
+    text_block_open = False
+    text_index = None
+    next_index = 0
     full_text = ""
+    # Accumulate tool calls by their OpenAI streaming index.
+    tool_calls = {}
+    finish_reason = "stop"
+    usage_out = 0
+
     for line in resp:
         line = line.decode().strip()
         if not line or line == "data: [DONE]":
             continue
-        if line.startswith("data: "):
-            try:
-                chunk = json.loads(line[6:])
-            except json.JSONDecodeError:
-                continue
-            delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-            if delta:
-                full_text += delta
-                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta','index': 0,'delta': {'type': 'text_delta','text': delta}})}\n\n"
+        if not line.startswith("data: "):
+            continue
+        try:
+            chunk = json.loads(line[6:])
+        except json.JSONDecodeError:
+            continue
+        choices = chunk.get("choices") or [{}]
+        choice = choices[0]
+        delta = choice.get("delta", {}) or {}
 
-    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop','index': 0})}\n\n"
-    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta','delta': {'stop_reason': 'end_turn','stop_sequence': None},'usage': {'output_tokens': len(full_text.split())}})}\n\n"
+        text = delta.get("content")
+        if text:
+            if not text_block_open:
+                text_index = next_index
+                next_index += 1
+                text_block_open = True
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start','index': text_index,'content_block': {'type': 'text','text': ''}})}\n\n"
+            full_text += text
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta','index': text_index,'delta': {'type': 'text_delta','text': text}})}\n\n"
+
+        for i, tc in enumerate(delta.get("tool_calls") or []):
+            idx = tc.get("index", i)
+            acc = tool_calls.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+            if tc.get("id"):
+                acc["id"] = tc["id"]
+            fn = tc.get("function", {}) or {}
+            if fn.get("name"):
+                acc["name"] = fn["name"]
+            if fn.get("arguments"):
+                acc["arguments"] += fn["arguments"]
+
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+        cu = chunk.get("usage") or {}
+        if cu.get("completion_tokens"):
+            usage_out = cu["completion_tokens"]
+
+    if text_block_open:
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop','index': text_index})}\n\n"
+
+    for idx in sorted(tool_calls):
+        acc = tool_calls[idx]
+        block_index = next_index
+        next_index += 1
+        tool_id = acc["id"] or f"toolu_{uuid.uuid4().hex[:12]}"
+        args = acc["arguments"] or "{}"
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start','index': block_index,'content_block': {'type': 'tool_use','id': tool_id,'name': acc['name'] or '','input': {}}})}\n\n"
+        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta','index': block_index,'delta': {'type': 'input_json_delta','partial_json': args}})}\n\n"
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop','index': block_index})}\n\n"
+
+    if tool_calls:
+        finish_reason = "tool_calls"
+    stop_reason = _FINISH_TO_STOP.get(finish_reason, "end_turn")
+    if not usage_out:
+        usage_out = len(full_text.split())
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta','delta': {'stop_reason': stop_reason,'stop_sequence': None},'usage': {'output_tokens': usage_out}})}\n\n"
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
 
 class AnthropicProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/v1/models":
+        path = urlparse(self.path).path
+        if path == "/v1/models":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -181,7 +358,8 @@ class AnthropicProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        if self.path == "/v1/messages":
+        path = urlparse(self.path).path
+        if path == "/v1/messages":
             content_len = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(content_len))
             openai_body = anthropic_messages_to_openai(body)
@@ -211,7 +389,10 @@ class AnthropicProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format, *args):
-        sys.stderr.write(f"[{self.log_date_time_string()}] {args[0]} {args[1]} {args[2]}\n")
+        try:
+            sys.stderr.write(f"[{self.log_date_time_string()}] {format % args}\n")
+        except (TypeError, IndexError):
+            sys.stderr.write(f"[{self.log_date_time_string()}] {format} {args}\n")
 
 
 def main():
