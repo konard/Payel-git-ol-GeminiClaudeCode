@@ -13,11 +13,34 @@ GEMINI_API_KEY = "sk-gemini"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 8082
 
+# Model ids the gemini-web2api backend actually understands. Anything we
+# forward MUST be one of these, otherwise the backend answers
+# "model '...' not found" (HTTP 400) and Claude Code reports the model as
+# unavailable (see issue #3).
+BACKEND_FLASH = "gemini-2.5-flash"
+BACKEND_FLASH_THINKING = "gemini-2.5-flash-thinking"
+BACKEND_PRO = "gemini-2.5-pro"
+
+# Translate every model name a client may send into a backend model id.
+# Claude Code sends either a Claude model id (when gateway model discovery is
+# off) or one of the friendly aliases advertised by /v1/models below. Both must
+# land on a real backend model.
 MODEL_MAP = {
-    "claude-opus-4-7": "gemini-3.5-flash-thinking",
-    "claude-sonnet-4-7": "gemini-3.5-flash",
-    "claude-sonnet-4-6": "gemini-3.5-flash",
-    "claude-haiku-4-5": "gemini-flash-lite",
+    # Anthropic model ids -> backend models.
+    "claude-opus-4-7": BACKEND_FLASH_THINKING,
+    "claude-opus-4-8": BACKEND_FLASH_THINKING,
+    "claude-sonnet-4-7": BACKEND_FLASH,
+    "claude-sonnet-4-6": BACKEND_FLASH,
+    "claude-haiku-4-5": BACKEND_FLASH,
+    # Friendly aliases this adapter advertises -> backend models. Keeping these
+    # means users whose saved default is e.g. "gemini-3.5-flash" keep working.
+    "gemini-3.5-flash-thinking": BACKEND_FLASH_THINKING,
+    "gemini-3.5-flash": BACKEND_FLASH,
+    "gemini-flash-lite": BACKEND_FLASH,
+    # Real backend ids pass through unchanged (listed for clarity / safety).
+    "gemini-2.5-flash": BACKEND_FLASH,
+    "gemini-2.5-flash-thinking": BACKEND_FLASH_THINKING,
+    "gemini-2.5-pro": BACKEND_PRO,
 }
 
 AVAILABLE_MODELS = [

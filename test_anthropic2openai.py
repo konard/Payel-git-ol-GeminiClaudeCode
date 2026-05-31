@@ -3,9 +3,18 @@
 Run with:  python3 test_anthropic2openai.py
 """
 import json
+import os
+import sys
 import unittest
 
 import anthropic2openai as adapter
+
+# Make the bundled gemini-web2api backend importable so we can assert the
+# adapter only ever forwards model names the backend actually understands.
+_BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini-web2api")
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+from gemini_web2api.models import resolve_model as backend_resolve_model  # noqa: E402
 
 
 class TestRequestConversion(unittest.TestCase):
@@ -214,6 +223,48 @@ class TestStreamConversion(unittest.TestCase):
         self.assertEqual(json.loads(json_delta["delta"]["partial_json"]), {"city": "Tokyo"})
         msg_delta = [d for e, d in events if e == "message_delta"][0]
         self.assertEqual(msg_delta["delta"]["stop_reason"], "tool_use")
+
+
+class TestModelMappingMatchesBackend(unittest.TestCase):
+    """Regression for issue #3.
+
+    Claude Code reported "the selected model (gemini-3.5-flash) may not exist"
+    because the adapter advertised/forwarded model names (gemini-3.5-flash,
+    gemini-flash-lite, ...) that the gemini-web2api backend does not know, so
+    the backend answered ``model '...' not found`` (HTTP 400).
+
+    Contract: every model the adapter advertises or maps to must resolve
+    cleanly on the backend.
+    """
+
+    def _assert_backend_accepts(self, requested):
+        forwarded = adapter.resolve_model(requested)
+        _, _, _, err, _ = backend_resolve_model(forwarded)
+        self.assertIsNone(
+            err,
+            f"backend rejected '{forwarded}' (resolved from '{requested}'): {err}",
+        )
+
+    def test_advertised_models_are_resolvable(self):
+        self.assertTrue(adapter.AVAILABLE_MODELS)
+        for model in adapter.AVAILABLE_MODELS:
+            self._assert_backend_accepts(model["id"])
+
+    def test_mapped_model_names_are_resolvable(self):
+        for name in adapter.MODEL_MAP:
+            self._assert_backend_accepts(name)
+
+    def test_default_model_is_resolvable(self):
+        # Default applied when a request omits the model field
+        # (see anthropic_messages_to_openai).
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        out = adapter.anthropic_messages_to_openai(body)
+        _, _, _, err, _ = backend_resolve_model(out["model"])
+        self.assertIsNone(err, f"default model '{out['model']}' rejected: {err}")
+
+    def test_issue_scenario_gemini_3_5_flash(self):
+        # The exact model the user selected in issue #3.
+        self._assert_backend_accepts("gemini-3.5-flash")
 
 
 if __name__ == "__main__":
