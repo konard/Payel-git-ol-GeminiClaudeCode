@@ -1,14 +1,18 @@
 """End-to-end regression test for issue #3.
 
-Runs the *real* gemini-web2api backend and the anthropic2openai adapter in
-threads (mocking only the upstream Gemini call) and sends an Anthropic
-/v1/messages request exactly like Claude Code does when the user has selected
-the ``gemini-3.5-flash`` model.
+Symptom: after selecting the ``gemini-3.5-flash`` model and sending a message,
+Claude Code reported "There's an issue with the selected model
+(gemini-3.5-flash). It may not exist or you may not have access to it."
 
-Before the fix the backend answered ``model 'gemini-3.5-flash' not found``
-(HTTP 400) and Claude Code reported the model as unavailable. After the fix the
-adapter translates the advertised name to a real backend model and the request
-succeeds.
+Root cause: the adapter only handled ``GET /v1/models`` and ``POST /v1/messages``
+and answered 404 for everything else. Claude Code validates the selected model
+with ``GET /v1/models/{id}`` and counts tokens with
+``POST /v1/messages/count_tokens`` before sending; those 404s are surfaced as
+the model being unavailable.
+
+This test runs the real anthropic2openai adapter (and, for the chat path, the
+real gemini-web2api backend with only the upstream Gemini call mocked) and
+exercises the exact endpoints Claude Code hits.
 
 Run with:  python3 test_integration_issue3.py
 """
@@ -34,8 +38,7 @@ ADAPTER_PORT = adapter.LISTEN_PORT  # 8082
 
 
 def _fake_generate(prompt, model_id, think_mode, file_refs=None, extra_fields=None):
-    # Echo the model id back so the test can assert which backend model was hit.
-    return f"Привет! (model_id={model_id})"
+    return "Привет! Чем могу помочь?"
 
 
 def _fake_generate_stream(prompt, model_id, think_mode, file_refs=None, extra_fields=None):
@@ -70,12 +73,13 @@ class TestIssue3EndToEnd(unittest.TestCase):
         backend_server.generate = cls._orig_generate
         backend_server.generate_stream = cls._orig_generate_stream
 
-    def _post_messages(self, body):
+    def _request(self, method, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(
-            f"http://127.0.0.1:{ADAPTER_PORT}/v1/messages",
-            data=json.dumps(body).encode(),
+            f"http://127.0.0.1:{ADAPTER_PORT}{path}",
+            data=data,
             headers={"Content-Type": "application/json"},
-            method="POST",
+            method=method,
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -83,8 +87,37 @@ class TestIssue3EndToEnd(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode()
 
-    def test_non_stream_selected_gemini_flash(self):
-        status, raw = self._post_messages({
+    # --- The endpoints that triggered the issue (used to 404) ---------------
+
+    def test_retrieve_selected_model(self):
+        # Exact scenario from issue #3: Claude Code validates the selected model.
+        status, raw = self._request("GET", "/v1/models/gemini-3.5-flash")
+        self.assertEqual(status, 200, raw)
+        self.assertEqual(json.loads(raw)["id"], "gemini-3.5-flash")
+
+    def test_retrieve_arbitrary_model(self):
+        status, raw = self._request("GET", "/v1/models/claude-opus-4-7")
+        self.assertEqual(status, 200, raw)
+        self.assertEqual(json.loads(raw)["id"], "claude-opus-4-7")
+
+    def test_count_tokens(self):
+        status, raw = self._request("POST", "/v1/messages/count_tokens", {
+            "model": "gemini-3.5-flash",
+            "messages": [{"role": "user", "content": "Привет"}],
+        })
+        self.assertEqual(status, 200, raw)
+        self.assertIsInstance(json.loads(raw)["input_tokens"], int)
+
+    def test_models_list(self):
+        status, raw = self._request("GET", "/v1/models")
+        self.assertEqual(status, 200, raw)
+        ids = [m["id"] for m in json.loads(raw)["data"]]
+        self.assertIn("gemini-3.5-flash", ids)
+
+    # --- The actual chat path still works -----------------------------------
+
+    def test_non_stream_message(self):
+        status, raw = self._request("POST", "/v1/messages", {
             "model": "gemini-3.5-flash",
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "Привет"}],
@@ -94,12 +127,9 @@ class TestIssue3EndToEnd(unittest.TestCase):
         self.assertEqual(data["type"], "message")
         text = "".join(b["text"] for b in data["content"] if b["type"] == "text")
         self.assertIn("Привет", text)
-        # The real backend model must have been a valid one (2.5 family).
-        self.assertIn("gemini-2.5-flash", text)
-        self.assertNotIn("not found", raw)
 
-    def test_stream_selected_gemini_flash(self):
-        status, raw = self._post_messages({
+    def test_stream_message(self):
+        status, raw = self._request("POST", "/v1/messages", {
             "model": "gemini-3.5-flash",
             "max_tokens": 100,
             "stream": True,
@@ -108,14 +138,6 @@ class TestIssue3EndToEnd(unittest.TestCase):
         self.assertEqual(status, 200, raw)
         self.assertIn("message_start", raw)
         self.assertIn("Привет", raw)
-        self.assertNotIn("not found", raw)
-
-    def test_models_endpoint_lists_selected_model(self):
-        req = urllib.request.Request(f"http://127.0.0.1:{ADAPTER_PORT}/v1/models")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-        ids = [m["id"] for m in data["data"]]
-        self.assertIn("gemini-3.5-flash", ids)
 
 
 if __name__ == "__main__":

@@ -13,34 +13,15 @@ GEMINI_API_KEY = "sk-gemini"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 8082
 
-# Model ids the gemini-web2api backend actually understands. Anything we
-# forward MUST be one of these, otherwise the backend answers
-# "model '...' not found" (HTTP 400) and Claude Code reports the model as
-# unavailable (see issue #3).
-BACKEND_FLASH = "gemini-2.5-flash"
-BACKEND_FLASH_THINKING = "gemini-2.5-flash-thinking"
-BACKEND_PRO = "gemini-2.5-pro"
-
-# Translate every model name a client may send into a backend model id.
-# Claude Code sends either a Claude model id (when gateway model discovery is
-# off) or one of the friendly aliases advertised by /v1/models below. Both must
-# land on a real backend model.
+# Map the Claude model ids Claude Code may send (when gateway model discovery
+# is off) onto the Gemini models the gemini-web2api backend exposes. The Gemini
+# ids below are real backend models (see gemini-web2api/gemini_web2api/models.py)
+# and are also what /v1/models advertises, so they pass through unchanged.
 MODEL_MAP = {
-    # Anthropic model ids -> backend models.
-    "claude-opus-4-7": BACKEND_FLASH_THINKING,
-    "claude-opus-4-8": BACKEND_FLASH_THINKING,
-    "claude-sonnet-4-7": BACKEND_FLASH,
-    "claude-sonnet-4-6": BACKEND_FLASH,
-    "claude-haiku-4-5": BACKEND_FLASH,
-    # Friendly aliases this adapter advertises -> backend models. Keeping these
-    # means users whose saved default is e.g. "gemini-3.5-flash" keep working.
-    "gemini-3.5-flash-thinking": BACKEND_FLASH_THINKING,
-    "gemini-3.5-flash": BACKEND_FLASH,
-    "gemini-flash-lite": BACKEND_FLASH,
-    # Real backend ids pass through unchanged (listed for clarity / safety).
-    "gemini-2.5-flash": BACKEND_FLASH,
-    "gemini-2.5-flash-thinking": BACKEND_FLASH_THINKING,
-    "gemini-2.5-pro": BACKEND_PRO,
+    "claude-opus-4-7": "gemini-3.5-flash-thinking",
+    "claude-sonnet-4-7": "gemini-3.5-flash",
+    "claude-sonnet-4-6": "gemini-3.5-flash",
+    "claude-haiku-4-5": "gemini-flash-lite",
 }
 
 AVAILABLE_MODELS = [
@@ -67,6 +48,45 @@ AVAILABLE_MODELS = [
 
 def resolve_model(model: str) -> str:
     return MODEL_MAP.get(model, model)
+
+
+def find_model(model_id: str) -> dict:
+    """Return an Anthropic model object for ``model_id``.
+
+    Claude Code validates the selected model by retrieving it via
+    ``GET /v1/models/{model_id}`` (the Anthropic "Get a Model" endpoint). If the
+    adapter answers 404 there, Claude Code reports "the selected model may not
+    exist or you may not have access to it" (issue #3). The gemini-web2api
+    backend accepts any model name (unknown ones fall back to its default), so we
+    mirror that and always return a model object: the advertised entry when we
+    have one, otherwise a synthesized object for the requested id.
+    """
+    for m in AVAILABLE_MODELS:
+        if m["id"] == model_id:
+            return m
+    return {
+        "type": "model",
+        "id": model_id,
+        "display_name": model_id,
+        "created": 1700000000,
+    }
+
+
+def estimate_tokens(body: dict) -> int:
+    """Rough token estimate for the Anthropic ``count_tokens`` endpoint.
+
+    Claude Code calls ``POST /v1/messages/count_tokens`` before sending a
+    message; a 404 there is also surfaced as a model error, so the adapter must
+    answer it. The gemini-web2api backend exposes no token counter, so we
+    approximate (~4 characters per token) which is plenty for context sizing.
+    """
+    text = extract_text(body.get("system", ""))
+    for m in body.get("messages", []):
+        text += " " + extract_text(m.get("content", ""))
+    for t in body.get("tools", []) or []:
+        if isinstance(t, dict):
+            text += " " + str(t.get("description", "")) + " " + json.dumps(t.get("input_schema", {}))
+    return max(1, len(text) // 4)
 
 
 def extract_text(content) -> str:
@@ -369,20 +389,34 @@ def proxy_stream(openai_body: dict):
 
 
 class AnthropicProxyHandler(http.server.BaseHTTPRequestHandler):
+    def _send_json(self, payload, status=200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/v1/models":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"data": AVAILABLE_MODELS}).encode())
+            self._send_json({"data": AVAILABLE_MODELS, "has_more": False})
+        elif path.startswith("/v1/models/"):
+            # Anthropic "Get a Model" endpoint, used by Claude Code to validate
+            # the selected model. Always resolves (see find_model) so the model
+            # is never reported as missing.
+            model_id = path[len("/v1/models/"):]
+            self._send_json(find_model(model_id))
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path == "/v1/messages":
+        if path == "/v1/messages/count_tokens":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_len)) if content_len else {}
+            self._send_json({"input_tokens": estimate_tokens(body)})
+        elif path == "/v1/messages":
             content_len = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(content_len))
             openai_body = anthropic_messages_to_openai(body)
